@@ -89,7 +89,8 @@ def tcp_pi_thread():
                 socketio.emit("frame", b64)
 
             elif mtype == TYPE_CMD:
-                print("[TCP] CMD FROM PI:", payload[:80])
+                # Pi -> Server로 CMD 올 수도 있음(로그용)
+                print("[TCP] CMD FROM PI:", payload[:200])
 
     except Exception as e:
         print("[TCP] error:", e)
@@ -124,7 +125,11 @@ def on_disconnect():
 
 @socketio.on("alert")
 def on_alert(data):
-    cmd = json.dumps({"cmd": "ALERT", "payload": data}).encode("utf-8")
+    """
+    브라우저(ml5)에서 탐지 -> 서버 -> Pi로 전달
+    data 예: { type:'person', confidence:0.78, message:'사람이 앞에 있습니다' }
+    """
+    cmd = json.dumps({"cmd": "ALERT", "payload": data}, ensure_ascii=False).encode("utf-8")
     with pi_lock:
         if not pi_conn:
             print("[CMD] Pi not connected, drop alert")

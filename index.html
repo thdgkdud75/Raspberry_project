@@ -1,134 +1,146 @@
 <!doctype html>
-<html>
+<html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>Pi Stream + Sensor + ml5 Obstacle</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>실시간 카메라 + ml5 객체 인식</title>
 
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <!-- ✅ Socket.IO는 서버가 제공하는 걸 사용 (버전 불일치 방지) -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- ✅ ml5는 0.12.2로 고정 -->
   <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
 
   <style>
-    body { font-family: sans-serif; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
     .wrap { display: flex; gap: 16px; align-items: flex-start; }
-    img { border: 1px solid #ccc; background: #fafafa; }
-    pre { background: #f6f6f6; padding: 10px; width: 360px; height: 480px; overflow: auto; }
+    .panel { width: 360px; }
+    #cam { width: 640px; height: auto; background: #111; border-radius: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    .title { font-weight: 800; margin-bottom: 8px; }
+    .msg { font-size: 18px; font-weight: 800; padding: 12px; border-radius: 12px; }
+    .ok { background: #eef7ee; color: #115511; border: 1px solid #bfe2bf; }
+    .warn { background: #fff1f1; color: #8a1212; border: 1px solid #ffbcbc; }
+    .small { font-size: 12px; opacity: 0.8; margin-top: 8px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid #ddd; font-size: 12px; margin-right:6px;}
+    pre { white-space: pre-wrap; margin:0; font-size:12px; background:#fafafa; border-radius:12px; padding:12px; border:1px solid #eee; max-height:220px; overflow:auto;}
   </style>
 </head>
+
 <body>
-  <h2>Pi Camera + Sensor + ml5 Obstacle Alert</h2>
+  <h2>실시간 카메라 + ml5 객체 인식</h2>
 
   <div class="wrap">
     <div>
-      <img id="cam" width="640" height="480" />
-      <div id="status">loading...</div>
+      <img id="cam" alt="camera frame" />
     </div>
-    <pre id="sensor"></pre>
+
+    <div class="panel">
+      <div class="card">
+        <div class="title">안내 메시지</div>
+        <div id="statusMsg" class="msg ok">정상: 전방 위험 없음</div>
+        <div class="small">
+          <span class="pill" id="piConn">Pi: ?</span>
+          <span class="pill" id="det">Detect: 준비중</span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <div class="title">센서 수신(문자열)</div>
+        <pre id="sensorBox"></pre>
+      </div>
+    </div>
   </div>
 
-  <script>
-    // ✅ 웹소켓만 사용(중요: 5분 후 뜨는 문제 방지)
-    const socket = io({ transports: ["websocket"] });
+<script>
+  // ✅ 소켓 연결 (서버/클라 버전 맞춰짐)
+  const socket = io();
 
-    const img = document.getElementById("cam");
-    const sensorEl = document.getElementById("sensor");
-    const statusEl = document.getElementById("status");
+  const img = document.getElementById("cam");
+  const statusMsg = document.getElementById("statusMsg");
+  const sensorBox = document.getElementById("sensorBox");
+  const piConn = document.getElementById("piConn");
+  const detEl = document.getElementById("det");
 
-    let detector = null;
-    let busy = false;
-    let latestDist = 999;
-    let lastAlert = 0;
+  // ===== 프레임 수신 =====
+  socket.on("frame", (b64) => {
+    img.src = "data:image/jpeg;base64," + b64;
+  });
 
-    // 장애물 기준
-    const DIST_THRESHOLD = 35;
-    const MIN_CONF = 0.60;
-    const MIN_AREA_RATIO = 0.08;
-    const ALERT_COOLDOWN_MS = 1500;
+  // ===== 센서 수신 =====
+  socket.on("sensor", (msg) => {
+    const t = new Date().toLocaleTimeString();
+    sensorBox.textContent = `[${t}] ${msg}\n` + sensorBox.textContent;
+  });
 
-    socket.on("connect", () => {
-      console.log("socket connected:", socket.id);
-      statusEl.textContent = "socket connected, loading ml5...";
-    });
-    socket.on("connect_error", (e) => {
-      console.error("socket connect_error:", e);
-      statusEl.textContent = "socket connect_error (서버/방화벽 확인)";
-    });
+  // ===== health =====
+  async function pollHealth() {
+    try {
+      const r = await fetch("/health");
+      const j = await r.json();
+      piConn.textContent = `Pi: ${j.pi_connected ? "연결됨" : "끊김"}`;
+    } catch(e) {
+      piConn.textContent = "Pi: ?";
+    }
+  }
+  setInterval(pollHealth, 1000);
+  pollHealth();
 
-    // 센서
-    socket.on("sensor", (jsonStr) => {
-      sensorEl.textContent = jsonStr;
-      try {
-        const s = JSON.parse(jsonStr);
-        if (typeof s.ultrasonic_cm === "number") latestDist = s.ultrasonic_cm;
-      } catch {}
-    });
+  // ===== ml5 휴대폰 감지 =====
+  const PHONE_LABELS = new Set(["cell phone"]); // COCO-SSD 라벨
+  const PHONE_CONF_MIN = 0.55;
 
-    // 프레임(화면)
-    socket.on("frame", (b64) => {
-      img.src = "data:image/jpeg;base64," + b64;
-    });
+  let lastPhoneSeenAt = 0;
+  const HOLD_MS = 1500;
 
-    // 중앙 ROI
-    function inCenterROI(box, W, H) {
-      const cx = box.x + box.width / 2;
-      const cy = box.y + box.height / 2;
-      const x1 = W * 0.30, x2 = W * 0.70;
-      const y1 = H * 0.20, y2 = H * 0.90;
-      return (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2);
+  function setMessage(isWarn, text) {
+    statusMsg.className = "msg " + (isWarn ? "warn" : "ok");
+    statusMsg.textContent = text;
+  }
+
+  let detector = null;
+
+  ml5.objectDetector("cocossd", (err, d) => {
+    if (err) {
+      console.error(err);
+      detEl.textContent = "Detect: 실패";
+      return;
+    }
+    detector = d;
+    detEl.textContent = "Detect: 실행중";
+    detectLoop();
+  });
+
+  function detectLoop() {
+    if (!detector) return;
+
+    // ✅ img가 아직 프레임을 못 받은 상태면 스킵
+    if (!img.src || img.naturalWidth === 0) {
+      setTimeout(detectLoop, 300);
+      return;
     }
 
-    function isObstacle(results, W, H) {
-      const allowed = new Set(["person","chair","couch","tv","bottle","cup","book","laptop","cell phone"]);
-      const hitVision = results.some(r => {
-        if (!allowed.has(r.label)) return false;
-        if (r.confidence < MIN_CONF) return false;
-        const areaRatio = (r.width * r.height) / (W * H);
-        if (areaRatio < MIN_AREA_RATIO) return false;
-        if (!inCenterROI(r, W, H)) return false;
-        return true;
-      });
-      const hitDistance = (latestDist < DIST_THRESHOLD);
-      return hitVision && hitDistance;
-    }
+    detector.detect(img, (err, results) => {
+      if (!err && results) {
+        let foundPhone = false;
 
-    // ml5 로드(콜백)
-    ml5.objectDetector("cocossd", (err, d) => {
-      if (err) {
-        console.error(err);
-        statusEl.textContent = "ml5 load error (console)";
-        return;
-      }
-      detector = d;
-      console.log("detector ready");
-      statusEl.textContent = "ml5 ready. waiting frames...";
-    });
-
-    // 감지(3fps) - 화면 갱신 방해하지 않게 분리
-    setInterval(async () => {
-      if (!detector || busy) return;
-
-      const W = img.naturalWidth || 0;
-      const H = img.naturalHeight || 0;
-      if (!W || !H) return;
-
-      busy = true;
-      try {
-        const results = await detector.detect(img);
-        const obstacle = isObstacle(results, W, H);
-        const now = Date.now();
-
-        statusEl.textContent = `dist=${latestDist.toFixed(1)}cm, obstacle=${obstacle}, objs=${results.length}`;
-
-        if (obstacle && (now - lastAlert > ALERT_COOLDOWN_MS)) {
-          lastAlert = now;
-          console.log("ALERT sent", latestDist);
-          socket.emit("alert", { reason: "obstacle", dist_cm: latestDist, ts: now });
+        for (const r of results) {
+          if (PHONE_LABELS.has(r.label) && r.confidence >= PHONE_CONF_MIN) {
+            foundPhone = true;
+            lastPhoneSeenAt = Date.now();
+            setMessage(true, "⚠ 위험: 휴대폰이 감지되었습니다");
+            break;
+          }
         }
-      } catch (e) {
-        console.error("detect error:", e);
-      } finally {
-        busy = false;
+
+        if (!foundPhone && Date.now() - lastPhoneSeenAt > HOLD_MS) {
+          setMessage(false, "정상: 전방 위험 없음");
+        }
       }
-    }, 333);
-  </script>
+      setTimeout(detectLoop, 500);
+    });
+  }
+</script>
+
 </body>
 </html>
