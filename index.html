@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Pi Stream + Sensor + ml5 Obstacle</title>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+
+  <style>
+    body { font-family: sans-serif; }
+    .wrap { display: flex; gap: 16px; align-items: flex-start; }
+    img { border: 1px solid #ccc; background: #fafafa; }
+    pre { background: #f6f6f6; padding: 10px; width: 360px; height: 480px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h2>Pi Camera + Sensor + ml5 Obstacle Alert</h2>
+
+  <div class="wrap">
+    <div>
+      <img id="cam" width="640" height="480" />
+      <div id="status">loading...</div>
+    </div>
+    <pre id="sensor"></pre>
+  </div>
+
+  <script>
+    // ✅ 웹소켓만 사용(중요: 5분 후 뜨는 문제 방지)
+    const socket = io({ transports: ["websocket"] });
+
+    const img = document.getElementById("cam");
+    const sensorEl = document.getElementById("sensor");
+    const statusEl = document.getElementById("status");
+
+    let detector = null;
+    let busy = false;
+    let latestDist = 999;
+    let lastAlert = 0;
+
+    // 장애물 기준
+    const DIST_THRESHOLD = 35;
+    const MIN_CONF = 0.60;
+    const MIN_AREA_RATIO = 0.08;
+    const ALERT_COOLDOWN_MS = 1500;
+
+    socket.on("connect", () => {
+      console.log("socket connected:", socket.id);
+      statusEl.textContent = "socket connected, loading ml5...";
+    });
+    socket.on("connect_error", (e) => {
+      console.error("socket connect_error:", e);
+      statusEl.textContent = "socket connect_error (서버/방화벽 확인)";
+    });
+
+    // 센서
+    socket.on("sensor", (jsonStr) => {
+      sensorEl.textContent = jsonStr;
+      try {
+        const s = JSON.parse(jsonStr);
+        if (typeof s.ultrasonic_cm === "number") latestDist = s.ultrasonic_cm;
+      } catch {}
+    });
+
+    // 프레임(화면)
+    socket.on("frame", (b64) => {
+      img.src = "data:image/jpeg;base64," + b64;
+    });
+
+    // 중앙 ROI
+    function inCenterROI(box, W, H) {
+      const cx = box.x + box.width / 2;
+      const cy = box.y + box.height / 2;
+      const x1 = W * 0.30, x2 = W * 0.70;
+      const y1 = H * 0.20, y2 = H * 0.90;
+      return (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2);
+    }
+
+    function isObstacle(results, W, H) {
+      const allowed = new Set(["person","chair","couch","tv","bottle","cup","book","laptop","cell phone"]);
+      const hitVision = results.some(r => {
+        if (!allowed.has(r.label)) return false;
+        if (r.confidence < MIN_CONF) return false;
+        const areaRatio = (r.width * r.height) / (W * H);
+        if (areaRatio < MIN_AREA_RATIO) return false;
+        if (!inCenterROI(r, W, H)) return false;
+        return true;
+      });
+      const hitDistance = (latestDist < DIST_THRESHOLD);
+      return hitVision && hitDistance;
+    }
+
+    // ml5 로드(콜백)
+    ml5.objectDetector("cocossd", (err, d) => {
+      if (err) {
+        console.error(err);
+        statusEl.textContent = "ml5 load error (console)";
+        return;
+      }
+      detector = d;
+      console.log("detector ready");
+      statusEl.textContent = "ml5 ready. waiting frames...";
+    });
+
+    // 감지(3fps) - 화면 갱신 방해하지 않게 분리
+    setInterval(async () => {
+      if (!detector || busy) return;
+
+      const W = img.naturalWidth || 0;
+      const H = img.naturalHeight || 0;
+      if (!W || !H) return;
+
+      busy = true;
+      try {
+        const results = await detector.detect(img);
+        const obstacle = isObstacle(results, W, H);
+        const now = Date.now();
+
+        statusEl.textContent = `dist=${latestDist.toFixed(1)}cm, obstacle=${obstacle}, objs=${results.length}`;
+
+        if (obstacle && (now - lastAlert > ALERT_COOLDOWN_MS)) {
+          lastAlert = now;
+          console.log("ALERT sent", latestDist);
+          socket.emit("alert", { reason: "obstacle", dist_cm: latestDist, ts: now });
+        }
+      } catch (e) {
+        console.error("detect error:", e);
+      } finally {
+        busy = false;
+      }
+    }, 333);
+  </script>
+</body>
+</html>
