@@ -63,8 +63,9 @@
   const detEl = document.getElementById("det");
 
   // ===== 프레임 수신 =====
+  // ✅ (1번 해결) dataURL 뒤에 #t=timestamp 를 붙여서 캐시/갱신 문제 방지
   socket.on("frame", (b64) => {
-    img.src = "data:image/jpeg;base64," + b64;
+    img.src = "data:image/jpeg;base64," + b64 + "#t=" + Date.now();
   });
 
   // ===== 센서 수신 =====
