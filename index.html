@@ -6,8 +6,7 @@
   <title>실시간 카메라 + ml5 객체 인식</title>
 
   <!-- ✅ Socket.IO는 서버가 제공하는 걸 사용 (버전 불일치 방지) -->
-  <script src="/socket.io/socket.io.js"></script>
-
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <!-- ✅ ml5는 0.12.2로 고정 -->
   <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
 
@@ -65,8 +64,12 @@
   // ===== 프레임 수신 =====
   // ✅ (1번 해결) dataURL 뒤에 #t=timestamp 를 붙여서 캐시/갱신 문제 방지
   socket.on("frame", (b64) => {
-    img.src = "data:image/jpeg;base64," + b64 + "#t=" + Date.now();
-  });
+    // ✅ Data URI는 그 자체로 매번 새로운 데이터이므로 캐시 방지용 태그가 필요 없음
+    img.src = "data:image/jpeg;base64," + b64;
+    
+    // (디버깅용) 데이터가 진짜 오는지 확인하고 싶다면 아래 주석을 풀어보세요
+    // console.log("Frame received, length:", b64.length);
+});
 
   // ===== 센서 수신 =====
   socket.on("sensor", (msg) => {
