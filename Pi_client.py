@@ -1,166 +1,165 @@
-import socket, struct, time, json, threading, subprocess
+import socket, struct, threading, time, json
 import cv2
-from picamera2 import Picamera2
 
 # =========================
-# 서버 설정
+# 설정
 # =========================
-SERVER_IP = "192.168.0.25"  # ★ PC IP
+SERVER_IP = "192.168.0.25"   # ✅ PC(서버) IP로 바꿔줘
 SERVER_PORT = 6000
-
-# ✅ 빠르게 뜨게 하는 기본값
-FPS = 12
-JPEG_QUALITY = 50
 
 TYPE_SENSOR = 1
 TYPE_IMAGE  = 2
 TYPE_CMD    = 3
 
+JPEG_QUALITY = 70
+SEND_FPS = 10                # 카메라 전송 FPS (10~15 권장)
+SENSOR_INTERVAL = 1.0        # 센서 전송 주기(초)
+
 # =========================
-# 초음파(HC-SR04) GPIO 설정 (BCM)
+# TCP 프로토콜 함수
 # =========================
-TRIG = 23
-ECHO = 24
-
-def setup_ultrasonic():
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(TRIG, GPIO.OUT)
-    GPIO.setup(ECHO, GPIO.IN)
-    GPIO.output(TRIG, False)
-    time.sleep(0.1)
-    return GPIO
-
-def read_distance_cm(GPIO):
-    GPIO.output(TRIG, False)
-    time.sleep(0.0002)
-
-    GPIO.output(TRIG, True)
-    time.sleep(0.00001)
-    GPIO.output(TRIG, False)
-
-    timeout = 0.03
-    t0 = time.time()
-
-    while GPIO.input(ECHO) == 0:
-        if time.time() - t0 > timeout:
-            return 999.0
-    start = time.time()
-
-    while GPIO.input(ECHO) == 1:
-        if time.time() - start > timeout:
-            return 999.0
-    end = time.time()
-
-    return float((end - start) * 34300 / 2)
-
-def send_msg(sock, mtype: int, payload: bytes):
-    sock.sendall(struct.pack("!BI", mtype, len(payload)) + payload)
-
-def recvall(sock, n):
+def recvall(conn, n):
     data = b""
     while len(data) < n:
-        chunk = sock.recv(n - len(data))
+        chunk = conn.recv(n - len(data))
         if not chunk:
             return None
         data += chunk
     return data
 
-def recv_msg(sock):
-    header = recvall(sock, 5)
+def recv_msg(conn):
+    header = recvall(conn, 5)  # 1B type + 4B length
     if header is None:
         return None, None
     mtype, length = struct.unpack("!BI", header)
-    payload = recvall(sock, length)
+    payload = recvall(conn, length)
     if payload is None:
         return None, None
     return mtype, payload
 
-def play_alert():
-    subprocess.Popen(["aplay", "/home/pi/alert.wav"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def send_msg(conn, mtype, payload: bytes):
+    conn.sendall(struct.pack("!BI", mtype, len(payload)) + payload)
 
-def cmd_listener(sock):
+# =========================
+# CMD 수신 루프 (서버 -> Pi)
+# =========================
+def cmd_recv_loop(conn):
     while True:
-        mtype, payload = recv_msg(sock)
+        mtype, payload = recv_msg(conn)
         if mtype is None:
-            print("[Pi] server disconnected (cmd_listener)")
+            print("[PI] server disconnected (recv)")
             break
+
         if mtype == TYPE_CMD:
             try:
-                cmd = json.loads(payload.decode("utf-8"))
-                if cmd.get("cmd") == "ALERT":
-                    print("[Pi] ALERT received -> play sound")
-                    play_alert()
+                text = payload.decode("utf-8", errors="replace")
+                print("[PI] CMD IN:", text)
+
+                # 예: {"cmd":"ALERT","payload":{"type":"person","message":"사람이 앞에 있습니다"}}
+                obj = json.loads(text)
+                if obj.get("cmd") == "ALERT":
+                    p = obj.get("payload", {})
+                    msg = p.get("message", "경고")
+                    # 여기서 TTS/부저/스피커 출력 연결하면 됨
+                    print("[PI][ALERT]", msg)
+
             except Exception as e:
-                print("[Pi] cmd parse error:", e)
+                print("[PI] CMD parse error:", e)
 
+# =========================
+# 센서 전송 루프 (예시)
+# =========================
+def sensor_send_loop(conn):
+    while True:
+        try:
+            # ✅ 너 프로젝트에 맞게 초음파/기타 센서값 넣으면 됨
+            data = {
+                "ultrasonic_cm": None,
+                "ts": time.time()
+            }
+            msg = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            send_msg(conn, TYPE_SENSOR, msg)
+        except Exception as e:
+            print("[PI] sensor send error:", e)
+            break
+        time.sleep(SENSOR_INTERVAL)
+
+# =========================
+# 카메라 전송 루프
+# =========================
+def camera_send_loop(conn):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[PI] camera open failed")
+        return
+
+    frame_interval = 1.0 / float(SEND_FPS)
+    last = time.time()
+
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)]
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("[PI] camera read failed")
+            break
+
+        # 필요하면 크기 줄여서 속도 올리기
+        # frame = cv2.resize(frame, (640, 480))
+
+        ok, jpg = cv2.imencode(".jpg", frame, encode_param)
+        if not ok:
+            continue
+
+        try:
+            send_msg(conn, TYPE_IMAGE, jpg.tobytes())
+        except Exception as e:
+            print("[PI] image send error:", e)
+            break
+
+        # FPS 제어
+        now = time.time()
+        dt = now - last
+        if dt < frame_interval:
+            time.sleep(frame_interval - dt)
+        last = time.time()
+
+    cap.release()
+
+# =========================
+# main
+# =========================
 def main():
-    GPIO = setup_ultrasonic()
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((SERVER_IP, SERVER_PORT))
-    print("[Pi] connected to server")
-
-    threading.Thread(target=cmd_listener, args=(sock,), daemon=True).start()
-
-    picam2 = Picamera2()
-
-    # ✅ 기본 640x480 (느리면 320x240으로 바꿔서 테스트)
-    cfg = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
-    # cfg = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})  # ← 더 빠름
-
-    picam2.configure(cfg)
-    picam2.start()
-    time.sleep(0.5)
-
-    interval = 1.0 / FPS
-    frame_count = 0
-
-    try:
-        while True:
-            t0 = time.time()
-
-            dist = read_distance_cm(GPIO)
-            sensors = {"ultrasonic_cm": dist, "ts": time.time()}
-            send_msg(sock, TYPE_SENSOR, json.dumps(sensors).encode("utf-8"))
-
-            frame = picam2.capture_array()  # RGB
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            ok, enc = cv2.imencode(".jpg", frame_bgr,
-                                   [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-            if ok:
-                jpg = enc.tobytes()
-                send_msg(sock, TYPE_IMAGE, jpg)
-            else:
-                jpg = b""
-
-            frame_count += 1
-            if frame_count % 12 == 0:
-                print(f"[Pi] sent dist={dist:.1f}cm, jpg_bytes={len(jpg)}")
-
-            dt = time.time() - t0
-            if interval - dt > 0:
-                time.sleep(interval - dt)
-
-    except KeyboardInterrupt:
-        print("[Pi] stopped by user")
-    except Exception as e:
-        print("[Pi] error:", e)
-    finally:
+    while True:
         try:
-            picam2.stop()
+            print(f"[PI] connecting to {SERVER_IP}:{SERVER_PORT} ...")
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.connect((SERVER_IP, SERVER_PORT))
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print("[PI] connected!")
+
+            t_cmd = threading.Thread(target=cmd_recv_loop, args=(conn,), daemon=True)
+            t_sen = threading.Thread(target=sensor_send_loop, args=(conn,), daemon=True)
+            t_cam = threading.Thread(target=camera_send_loop, args=(conn,), daemon=True)
+
+            t_cmd.start()
+            t_sen.start()
+            t_cam.start()
+
+            # 연결 유지 (cmd thread가 끊기면 재접속)
+            while t_cmd.is_alive() and t_cam.is_alive():
+                time.sleep(1)
+
+        except Exception as e:
+            print("[PI] connect/run error:", e)
+
+        try:
+            conn.close()
         except:
             pass
-        try:
-            sock.close()
-        except:
-            pass
-        try:
-            GPIO.cleanup()
-        except:
-            pass
-        print("[Pi] cleanup done")
+
+        print("[PI] retry in 2 sec...")
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
